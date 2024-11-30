@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"time"
@@ -25,21 +26,53 @@ const (
 
 // NetSource represents an inbound network socket connector.
 type NetSource struct {
-	ctx      context.Context
-	conn     net.Conn
-	listener net.Listener
-	connType ConnType
-	out      chan any
+	ctx         context.Context
+	conn        net.Conn
+	listener    net.Listener
+	connType    ConnType
+	out         chan any
+	bufferSize  int
+	sendTimeout time.Duration
 }
 
 var _ streams.Source = (*NetSource)(nil)
 
+// NetSourceOption represents an option for configuring NetSource
+type NetSourceOption func(*NetSource)
+
+// WithBufferSize sets the buffer size for the output channel
+func WithBufferSize(size int) NetSourceOption {
+	return func(ns *NetSource) {
+		ns.bufferSize = size
+	}
+}
+
+// WithSendTimeout sets the timeout for sending messages to the output channel
+func WithSendTimeout(timeout time.Duration) NetSourceOption {
+	return func(ns *NetSource) {
+		ns.sendTimeout = timeout
+	}
+}
+
 // NewNetSource returns a new NetSource connector.
-func NewNetSource(ctx context.Context, connType ConnType, address string) (*NetSource, error) {
+func NewNetSource(ctx context.Context, connType ConnType, address string, opts ...NetSourceOption) (*NetSource, error) {
 	var err error
 	var conn net.Conn
 	var listener net.Listener
-	out := make(chan any)
+
+	source := &NetSource{
+		ctx:         ctx,
+		connType:    connType,
+		bufferSize:  1000,         // default buffer size
+		sendTimeout: time.Second,   // default timeout
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(source)
+	}
+
+	source.out = make(chan any, source.bufferSize)
 
 	switch connType {
 	case TCP:
@@ -48,25 +81,20 @@ func NewNetSource(ctx context.Context, connType ConnType, address string) (*NetS
 		if err != nil {
 			return nil, err
 		}
-		go acceptConnections(listener, out)
+		go acceptConnections(listener, source)
 	case UDP:
 		addr, _ := net.ResolveUDPAddr(string(connType), address)
 		conn, err = net.ListenUDP(string(connType), addr)
 		if err != nil {
 			return nil, err
 		}
-		go handleConnection(conn, out)
+		go handleConnection(conn, source)
 	default:
 		return nil, errors.New("invalid connection type")
 	}
 
-	source := &NetSource{
-		ctx:      ctx,
-		conn:     conn,
-		listener: listener,
-		connType: connType,
-		out:      out,
-	}
+	source.conn = conn
+	source.listener = listener
 
 	go source.listenCtx()
 	return source, nil
@@ -87,34 +115,66 @@ func (ns *NetSource) listenCtx() {
 }
 
 // acceptConnections accepts new TCP connections.
-func acceptConnections(listener net.Listener, out chan<- any) {
+func acceptConnections(listener net.Listener, source *NetSource) {
 	for {
 		// accept a new connection
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("listener.Accept() failed with: %s", err)
+			// Don't log if the listener was closed normally
+			if !errors.Is(err, net.ErrClosed) {
+				log.Printf("listener.Accept() failed with: %s", err)
+			}
 			return
 		}
 
 		// handle the new connection
-		go handleConnection(conn, out)
+		go handleConnection(conn, source)
 	}
 }
 
 // handleConnection handles new connections.
-func handleConnection(conn net.Conn, out chan<- any) {
+func handleConnection(conn net.Conn, source *NetSource) {
 	log.Printf("NetSource connected on: %v", conn.LocalAddr())
 	reader := bufio.NewReader(conn)
+	buffer := make([]byte, 0, 4096)
 
 	for {
+		// Read into buffer
 		bufferBytes, err := reader.ReadBytes('\n')
-		if len(bufferBytes) > 0 {
-			out <- string(bufferBytes)
+		if err != nil {
+			if len(buffer) > 0 {
+				// Don't send partial messages
+				log.Printf("Discarding partial message of length %d", len(buffer))
+			}
+			if err != io.EOF {
+				log.Printf("handleConnection failed with: %s", err)
+			}
+			break
 		}
 
-		if err != nil {
-			log.Printf("handleConnection failed with: %s", err)
-			break
+		// Append to buffer
+		buffer = append(buffer, bufferBytes...)
+
+		// Only send complete messages (ending in newline)
+		if len(buffer) > 0 && buffer[len(buffer)-1] == '\n' {
+			msg := string(buffer)
+			
+			// Keep trying to send until successful or context is done
+			for {
+				select {
+				case source.out <- msg:
+					// Message sent successfully
+					buffer = buffer[:0] // Reset buffer after successful send
+					goto nextMessage
+				case <-time.After(source.sendTimeout):
+					log.Printf("Channel send timed out after %v, retrying...", source.sendTimeout)
+					// Continue the retry loop
+				case <-source.ctx.Done():
+					return
+				}
+			}
+		nextMessage:
+			continue
 		}
 	}
 
