@@ -1,6 +1,8 @@
 module github.com/reugn/go-streams/examples
 
-go 1.21.0
+go 1.22.0
+
+toolchain go1.23.3
 
 require (
 	cloud.google.com/go/storage v1.43.0
